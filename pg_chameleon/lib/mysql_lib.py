@@ -1328,8 +1328,8 @@ class mysql_source(object):
                         self.pg_engine.write_batch(group_insert)
                         group_insert=[]
                     self.logger.info("QUERY EVENT - binlogfile %s, position %s.\n--------\n%s\n-------- " % (binlogfile, log_position, binlogevent.query))
-                    # replace "," -> "，"
-                    handled_sql = re.sub(r"(?i)comment '(.*?)'", lambda x: x.group(0).replace(",", "，"),binlogevent.query)
+                    # replace "," -> "，"，";" -> "；"
+                    handled_sql = re.sub(r"(?i)comment '(.*?)'", lambda x: x.group(0).replace(",", "，").replace(";", "；"), binlogevent.query)
                     # replace the constraint xxx unique (a,b) -> unique key xxx(a,b)
                     handled_sql = re.sub(re.compile(r"constraint\s+(\w+)\s+unique\s*\(\s*((?:\w+,\s*)*\w+)\s*\)", re.IGNORECASE), r"UNIQUE KEY \1(\2)", handled_sql)
                     sql_tokeniser.parse_sql(handled_sql)
