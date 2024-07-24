@@ -518,8 +518,9 @@ class replica_engine(object):
         self.pg_engine.logger  = log_read[0]
         while True:
             try:
-                self.mysql_source.read_replica()
-                time.sleep(self.sleep_loop)
+                continue_read_immediately = self.mysql_source.read_replica()
+                if not continue_read_immediately:
+                    time.sleep(self.sleep_loop)
             except Exception:
                 queue.put(traceback.format_exc())
                 break

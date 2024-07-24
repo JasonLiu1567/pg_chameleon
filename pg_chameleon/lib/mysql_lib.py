@@ -17,6 +17,7 @@ class mysql_source(object):
             Class constructor, the method sets the class variables and configure the
             operating parameters from the args provided t the class.
         """
+        self.table_type_map_cache = None
         self.statement_skip = ['BEGIN', 'COMMIT']
         self.schema_tables = {}
         self.schema_mappings = {}
@@ -1057,6 +1058,8 @@ class mysql_source(object):
             Each key maps a dictionary with the schema's tables stored as keys and the column/type mappings.
             The dictionary is used in the read_replica method, to determine whether a field requires hexadecimal conversion.
         """
+        if self.table_type_map_cache:
+            return self.table_type_map_cache
         table_type_map = {}
         table_map = {}
         self.logger.debug("collecting table type map")
@@ -1091,17 +1094,16 @@ class mysql_source(object):
                         ordinal_position
                     ;
                 """
-                table_charset = table["character_set"]
                 self.cursor_buffered.execute(sql_columns, (table["table_schema"], table["table_name"]))
                 column_data = self.cursor_buffered.fetchall()
                 for column in column_data:
                     column_type[column["column_name"]] = column["data_type"]
                 table_dict = {}
-                table_dict["table_charset"] = table_charset
                 table_dict["column_type"] = column_type
                 table_map[table["table_name"]] = table_dict
             table_type_map[schema] = table_map
             table_map = {}
+            self.table_type_map_cache = table_type_map
         return table_type_map
 
 
@@ -1237,6 +1239,7 @@ class mysql_source(object):
         :return: the batch's data composed by binlog name, binlog position and last event timestamp read from the mysql replica stream.
         :rtype: dictionary
         """
+        continue_read_immediately = False
         size_insert=0
         sql_tokeniser = sql_token()
         table_type_map = self.get_table_type_map()
@@ -1318,6 +1321,7 @@ class mysql_source(object):
 
                 if binlogevent.query.strip().upper() not in self.statement_skip and schema_query in self.schema_mappings:
                     close_batch=True
+                    self.table_type_map_cache = None
                     destination_schema = self.schema_mappings[schema_query]
                     log_position = binlogevent.packet.log_pos
                     master_data["File"] = binlogfile
@@ -1374,9 +1378,8 @@ class mysql_source(object):
                         self.logger.debug("writing the remaining %s row events when the statement event occurs" % (len(group_insert),))
                         self.pg_engine.write_batch(group_insert)
                     my_stream.close()
-                    return [master_data, close_batch]
+                    return [master_data, close_batch, continue_read_immediately]
             else:
-
                 for row in binlogevent.rows:
                     event_after={}
                     event_before={}
@@ -1391,104 +1394,105 @@ class mysql_source(object):
                     table_key_dic = "%s.%s" % (destination_schema, table_name)
                     store_row = self.__store_binlog_event(table_name, schema_row)
                     skip_event = self.__skip_event(table_name, schema_row, binlogevent)
-                    if store_row and not skip_event[0]:
-                        if table_key_dic in inc_tables:
-                            table_consistent = False
-                            log_seq = int(log_file.split('.')[1])
-                            log_pos = int(log_position)
-                            table_dic = inc_tables[table_key_dic]
-                            if log_seq > table_dic["log_seq"]:
-                                table_consistent = True
-                            elif log_seq == table_dic["log_seq"] and log_pos >= table_dic["log_pos"]:
-                                table_consistent = True
-                                self.logger.info("CONSISTENT POINT FOR TABLE %s REACHED  - binlogfile %s, position %s" % (table_key_dic, binlogfile, log_position))
-                            if table_consistent:
-                                add_row = True
-                                self.pg_engine.set_consistent_table(table_name, destination_schema)
-                                inc_tables = self.pg_engine.get_inconsistent_tables()
-                            else:
-                                add_row = False
-                        column_map = table_type_map[schema_row][table_name]["column_type"]
-                        table_charset = table_type_map[schema_row][table_name]["table_charset"]
+                    if not store_row or skip_event[0]:
+                        continue
+                    if table_key_dic in inc_tables:
+                        table_consistent = False
+                        log_seq = int(log_file.split('.')[1])
+                        log_pos = int(log_position)
+                        table_dic = inc_tables[table_key_dic]
+                        if log_seq > table_dic["log_seq"]:
+                            table_consistent = True
+                        elif log_seq == table_dic["log_seq"] and log_pos >= table_dic["log_pos"]:
+                            table_consistent = True
+                            self.logger.info("CONSISTENT POINT FOR TABLE %s REACHED  - binlogfile %s, position %s" % (table_key_dic, binlogfile, log_position))
+                        if table_consistent:
+                            add_row = True
+                            self.pg_engine.set_consistent_table(table_name, destination_schema)
+                            inc_tables = self.pg_engine.get_inconsistent_tables()
+                        else:
+                            add_row = False
+                    column_map = table_type_map[schema_row][table_name]["column_type"]
 
-                        global_data={
-                                            "binlog":log_file,
-                                            "logpos":log_position,
-                                            "schema": destination_schema,
-                                            "table": table_name,
-                                            "batch_id":id_batch,
-                                            "log_table":log_table,
-                                            "event_time":event_time
-                                        }
-                        if add_row:
-                            if skip_event[1] == "delete":
-                                global_data["action"] = "delete"
-                                event_after=row["values"]
-                            elif skip_event[1] == "update":
-                                global_data["action"] = "update"
-                                event_after=row["after_values"]
-                                event_before=row["before_values"]
-                            elif skip_event[1] == "insert":
-                                global_data["action"] = "insert"
-                                event_after=row["values"]
+                    global_data={
+                                        "binlog":log_file,
+                                        "logpos":log_position,
+                                        "schema": destination_schema,
+                                        "table": table_name,
+                                        "batch_id":id_batch,
+                                        "log_table":log_table,
+                                        "event_time":event_time
+                                    }
+                    if add_row:
+                        if skip_event[1] == "delete":
+                            global_data["action"] = "delete"
+                            event_after=row["values"]
+                        elif skip_event[1] == "update":
+                            global_data["action"] = "update"
+                            event_after=row["after_values"]
+                            event_before=row["before_values"]
+                        elif skip_event[1] == "insert":
+                            global_data["action"] = "insert"
+                            event_after=row["values"]
 
-                            for column_name in event_after:
-                                try:
-                                    column_type=column_map[column_name]
-                                except KeyError:
-                                    self.logger.debug("Detected inconsistent structure for the table  %s. The replay may fail. " % (table_name))
-                                    column_type = 'text'
-                                if column_type in self.hexify and event_after[column_name]:
-                                    event_after[column_name]=binascii.hexlify(event_after[column_name]).decode()
-                                elif column_type in self.hexify and isinstance(event_after[column_name], bytes):
-                                    event_after[column_name] = ''
-                                elif column_type == 'json':
-                                    event_after[column_name] = self.__decode_dic_keys(event_after[column_name])
-                                elif column_type in self.spatial_datatypes and event_after[column_name]:
-                                    event_after[column_name] = self.__get_text_spatial(event_after[column_name])
+                        for column_name in event_after:
+                            try:
+                                column_type=column_map[column_name]
+                            except KeyError:
+                                self.logger.debug("Detected inconsistent structure for the table  %s. The replay may fail. " % (table_name))
+                                column_type = 'text'
+                            if column_type in self.hexify and event_after[column_name]:
+                                event_after[column_name]=binascii.hexlify(event_after[column_name]).decode()
+                            elif column_type in self.hexify and isinstance(event_after[column_name], bytes):
+                                event_after[column_name] = ''
+                            elif column_type == 'json':
+                                event_after[column_name] = self.__decode_dic_keys(event_after[column_name])
+                            elif column_type in self.spatial_datatypes and event_after[column_name]:
+                                event_after[column_name] = self.__get_text_spatial(event_after[column_name])
 
+                        for column_name in event_before:
+                            try:
+                                column_type=column_map[column_name]
+                            except KeyError:
+                                self.logger.debug("Detected inconsistent structure for the table  %s. The replay may fail. " % (table_name))
+                                column_type = 'text'
+                            if column_type in self.hexify and event_before[column_name]:
+                                event_before[column_name]=binascii.hexlify(event_before[column_name]).decode()
+                            elif column_type in self.hexify and isinstance(event_before[column_name], bytes):
+                                event_before[column_name] = ''
+                            elif column_type == 'json':
+                                event_before[column_name] = self.__decode_dic_keys(event_after[column_name])
+                            elif column_type in self.spatial_datatypes and event_after[column_name]:
+                                event_before[column_name] = self.__get_text_spatial(event_before[column_name])
+                        event_insert={"global_data":global_data,"event_after":event_after,  "event_before":event_before}
+                        size_insert += len(str(event_insert))
+                        group_insert.append(event_insert)
 
-                            for column_name in event_before:
-                                try:
-                                    column_type=column_map[column_name]
-                                except KeyError:
-                                    self.logger.debug("Detected inconsistent structure for the table  %s. The replay may fail. " % (table_name))
-                                    column_type = 'text'
-                                if column_type in self.hexify and event_before[column_name]:
-                                    event_before[column_name]=binascii.hexlify(event_before[column_name]).decode()
-                                elif column_type in self.hexify and isinstance(event_before[column_name], bytes):
-                                    event_before[column_name] = ''
-                                elif column_type == 'json':
-                                    event_before[column_name] = self.__decode_dic_keys(event_after[column_name])
-                                elif column_type in self.spatial_datatypes and event_after[column_name]:
-                                    event_before[column_name] = self.__get_text_spatial(event_before[column_name])
-                            event_insert={"global_data":global_data,"event_after":event_after,  "event_before":event_before}
-                            size_insert += len(str(event_insert))
-                            group_insert.append(event_insert)
+                    master_data["File"]=log_file
+                    master_data["Position"]=log_position
+                    master_data["Time"]=event_time
+                    master_data["gtid"] = next_gtid
 
-                        master_data["File"]=log_file
-                        master_data["Position"]=log_position
-                        master_data["Time"]=event_time
-                        master_data["gtid"] = next_gtid
+                    if len(group_insert) >= self.replica_batch_size:
 
-                        if len(group_insert)>=self.replica_batch_size:
+                        self.logger.info("Max rows per batch reached. Writing %s. rows. Size in bytes: %s " % (len(group_insert), size_insert))
+                        self.logger.debug("Master coordinates: %s" % (master_data, ))
+                        self.pg_engine.write_batch(group_insert)
+                        size_insert=0
+                        group_insert=[]
+                        close_batch=True
 
-                            self.logger.info("Max rows per batch reached. Writing %s. rows. Size in bytes: %s " % (len(group_insert), size_insert))
-                            self.logger.debug("Master coordinates: %s" % (master_data, ))
-                            self.pg_engine.write_batch(group_insert)
-                            size_insert=0
-                            group_insert=[]
-                            close_batch=True
-
-
-
+                # close the batch when reached the maximum rows
+                if close_batch:
+                    continue_read_immediately = True
+                    break
         my_stream.close()
         if len(group_insert)>0:
             self.logger.debug("writing the last %s events" % (len(group_insert), ))
             self.pg_engine.write_batch(group_insert)
             close_batch=True
 
-        return [master_data, close_batch]
+        return [master_data, close_batch, continue_read_immediately]
 
 
     def read_replica(self):
@@ -1503,10 +1507,11 @@ class mysql_source(object):
             If the variable is not empty then the previous batch gets closed with a simple update of the processed flag.
 
         """
-
+        continue_read_immediately = False
         skip = self.__init_read_replica()
         if skip:
             self.logger.warning("Couldn't connect to the source database for reading the replica. Ignoring.")
+            return continue_read_immediately
         else:
             self.pg_engine.set_source_status("running")
             replica_paused = self.pg_engine.get_replica_paused()
@@ -1522,6 +1527,7 @@ class mysql_source(object):
                     replica_data=self.__read_replica_stream(batch_data)
                     master_data=replica_data[0]
                     close_batch=replica_data[1]
+                    continue_read_immediately = replica_data[2]
                     if "gtid" in master_data:
                         master_data["Executed_Gtid_Set"] = self.__build_gtid_set(master_data["gtid"])
                     else:
@@ -1542,9 +1548,8 @@ class mysql_source(object):
                 self.pg_engine.keep_existing_schema = self.keep_existing_schema
                 self.pg_engine.check_source_consistent()
 
-
             self.disconnect_db_buffered()
-
+            return continue_read_immediately
 
     def init_replica(self):
         """
