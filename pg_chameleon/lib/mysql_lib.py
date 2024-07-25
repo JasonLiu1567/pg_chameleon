@@ -1240,6 +1240,7 @@ class mysql_source(object):
         :rtype: dictionary
         """
         continue_read_immediately = False
+        begin_time = time.time()
         size_insert=0
         sql_tokeniser = sql_token()
         table_type_map = self.get_table_type_map()
@@ -1373,11 +1374,12 @@ class mysql_source(object):
 
 
                     sql_tokeniser.reset_lists()
-                if close_batch:
+                if close_batch or time.time() - begin_time >= 5:  # The maximum reading time for a batch is 5s
                     if len(group_insert) > 0:
                         self.logger.debug("writing the remaining %s row events when the statement event occurs" % (len(group_insert),))
                         self.pg_engine.write_batch(group_insert)
                     my_stream.close()
+                    continue_read_immediately = True
                     return [master_data, close_batch, continue_read_immediately]
             else:
                 for row in binlogevent.rows:
@@ -1482,10 +1484,6 @@ class mysql_source(object):
                         group_insert=[]
                         close_batch=True
 
-                # close the batch when reached the maximum rows
-                if close_batch:
-                    continue_read_immediately = True
-                    break
         my_stream.close()
         if len(group_insert)>0:
             self.logger.debug("writing the last %s events" % (len(group_insert), ))
